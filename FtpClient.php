@@ -149,7 +149,7 @@ class FtpClient implements Client
     public function mdtm($stream, string $remote): int
     {
         $ts = @ftp_mdtm($stream, $remote);
-        if ($ts === false) {
+        if ($ts === -1) {
             throw new RuntimeException("with remote=`{$remote}`");
         }
         return $ts;
