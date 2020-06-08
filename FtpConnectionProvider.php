@@ -5,10 +5,30 @@ declare(strict_types=1);
 namespace League\Flysystem\FTP;
 
 use const FTP_USEPASVADDRESS;
+use RuntimeException;
 
+/**
+ * Class FtpConnectionProvider
+ * @package League\Flysystem\FTP
+ */
 class FtpConnectionProvider implements ConnectionProvider
 {
     /**
+     * @var Client
+     */
+    private $client;
+
+    /**
+     * FtpConnectionProvider constructor.
+     * @param Client|null $client
+     */
+    public function __construct(?Client $client = null)
+    {
+        $this->client = $client ?? new FtpClient();
+    }
+
+    /**
+     * @param FtpConnectionOptions $options
      * @return resource
      * @throws FtpConnectionException
      */
@@ -27,48 +47,59 @@ class FtpConnectionProvider implements ConnectionProvider
             $this->ignorePassiveAddress($options, $connection);
             $this->makeConnectionPassive($options, $connection);
         } catch (FtpConnectionException $exception) {
-            ftp_close($connection);
+            $this->client->close($connection);
             throw $exception;
         }
-
         return $connection;
     }
 
     /**
+     * @param string $host
+     * @param int $port
+     * @param int $timeout
+     * @param bool $ssl
      * @return resource
+     * @throws UnableToConnectToFtpHost
      */
     private function createConnectionResource(string $host, int $port, int $timeout, bool $ssl)
     {
-        $connection = $ssl ? @ftp_ssl_connect($host, $port, $timeout) : @ftp_connect($host, $port, $timeout);
+        try {
+            $connection =
+                $ssl ?
+                    $this->client->sslConnect($host, $port, $timeout) :
+                    $this->client->connect($host, $port, $timeout);
 
-        if ( ! is_resource($connection)) {
+        } catch (RuntimeException $ex) {
             throw UnableToConnectToFtpHost::forHost($host, $port, $ssl);
         }
-
         return $connection;
     }
 
     /**
+     * @param FtpConnectionOptions $options
      * @param resource $connection
+     * @throws UnableToAuthenticate
      */
     private function authenticate(FtpConnectionOptions $options, $connection): void
     {
-        if ( ! @ftp_login($connection, $options->username(), $options->password())) {
+        try {
+            $this->client->login($connection, $options->username(), $options->password());
+        } catch (RuntimeException $ex) {
             throw new UnableToAuthenticate();
         }
     }
 
     /**
+     * @param FtpConnectionOptions $options
      * @param resource $connection
+     * @throws RuntimeException|UnableToEnableUtf8Mode
      */
     private function enableUtf8Mode(FtpConnectionOptions $options, $connection): void
     {
         if ( ! $options->utf8()) {
             return;
         }
-
-        $response = ftp_raw($connection, "OPTS UTF8 ON");
-
+        $response = $this->client->raw($connection, "OPTS UTF8 ON");
         if (substr($response[0] ?? '', 0, 3) !== '200') {
             throw new UnableToEnableUtf8Mode(
                 'Could not set UTF-8 mode for connection: ' . $options->host() . '::' . $options->port()
@@ -77,7 +108,9 @@ class FtpConnectionProvider implements ConnectionProvider
     }
 
     /**
+     * @param FtpConnectionOptions $options
      * @param resource $connection
+     * @throws RuntimeException|UnableToSetFtpOption
      */
     private function ignorePassiveAddress(FtpConnectionOptions $options, $connection): void
     {
@@ -87,17 +120,23 @@ class FtpConnectionProvider implements ConnectionProvider
             return;
         }
 
-        if ( ! ftp_set_option($connection, FTP_USEPASVADDRESS, ! $ignorePassiveAddress)) {
+        try {
+            $this->client->setOption($connection, FTP_USEPASVADDRESS, !$ignorePassiveAddress);
+        } catch (RuntimeException $ex) {
             throw UnableToSetFtpOption::whileSettingOption('FTP_USEPASVADDRESS');
         }
     }
 
     /**
+     * @param FtpConnectionOptions $options
      * @param resource $connection
+     * @throws UnableToMakeConnectionPassive
      */
     private function makeConnectionPassive(FtpConnectionOptions $options, $connection): void
     {
-        if ( ! ftp_pasv($connection, $options->passive())) {
+        try {
+            $this->client->pasv($connection, $options->passive());
+        } catch (RuntimeException $ex) {
             throw new UnableToMakeConnectionPassive(
                 'Could not set passive mode for connection: ' . $options->host() . '::' . $options->port()
             );
