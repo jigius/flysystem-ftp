@@ -27,6 +27,7 @@ use League\Flysystem\UnixVisibility\VisibilityConverter;
 use League\MimeTypeDetection\FinfoMimeTypeDetector;
 use League\MimeTypeDetection\MimeTypeDetector;
 use Throwable;
+use RuntimeException;
 
 class FtpAdapter implements FilesystemAdapter
 {
@@ -78,16 +79,23 @@ class FtpAdapter implements FilesystemAdapter
      */
     private $mimeTypeDetector;
 
+    /**
+     * @var Client
+     */
+    private $client;
+
     public function __construct(
         FtpConnectionOptions $connectionOptions,
         FtpConnectionProvider $connectionProvider = null,
         ConnectivityChecker $connectivityChecker = null,
         VisibilityConverter $visibilityConverter = null,
-        MimeTypeDetector $mimeTypeDetector = null
+        MimeTypeDetector $mimeTypeDetector = null,
+        Client $client = null
     ) {
+        $this->client = $client ?: new FtpClient();
         $this->connectionOptions = $connectionOptions;
-        $this->connectionProvider = $connectionProvider ?: new FtpConnectionProvider();
-        $this->connectivityChecker = $connectivityChecker ?: new NoopCommandConnectivityChecker();
+        $this->connectionProvider = $connectionProvider ?: new FtpConnectionProvider($this->client);
+        $this->connectivityChecker = $connectivityChecker ?: new NoopCommandConnectivityChecker($this->client);
         $this->visibilityConverter = $visibilityConverter ?: new PortableVisibilityConverter();
         $this->prefixer = new PathPrefixer($connectionOptions->root());
         $this->mimeTypeDetector = $mimeTypeDetector ?: new FinfoMimeTypeDetector();
@@ -108,7 +116,7 @@ class FtpAdapter implements FilesystemAdapter
             goto start;
         }
 
-        ftp_chdir($this->connection, $this->connectionOptions->root());
+        $this->client->chdir($this->connection, $this->connectionOptions->root());
 
         return $this->connection;
     }
@@ -119,7 +127,7 @@ class FtpAdapter implements FilesystemAdapter
             return $this->isPureFtpdServer;
         }
 
-        $response = ftp_raw($this->connection, 'HELP');
+        $response = $this->client->raw($this->connection, 'HELP');
 
         return $this->isPureFtpdServer = stripos(implode(' ', $response), 'Pure-FTPd') !== false;
     }
@@ -157,7 +165,9 @@ class FtpAdapter implements FilesystemAdapter
 
         $location = $this->prefixer->prefixPath($path);
 
-        if ( ! ftp_fput($this->connection(), $location, $resource, $this->connectionOptions->transferMode())) {
+        try {
+            $this->client->fput($this->connection(), $location, $resource, $this->connectionOptions->transferMode());
+        } catch (RuntimeException $ex) {
             throw UnableToWriteFile::atLocation($path, 'writing the file failed');
         }
 
@@ -185,11 +195,10 @@ class FtpAdapter implements FilesystemAdapter
     {
         $location = $this->prefixer->prefixPath($path);
         $stream = fopen('php://temp', 'w+b');
-        $result = @ftp_fget($this->connection(), $stream, $location, $this->connectionOptions->transferMode());
-
-        if ( ! $result) {
+        try {
+            $this->client->fget($this->connection(), $stream, $location, $this->connectionOptions->transferMode());
+        } catch (RuntimeException $ex) {
             fclose($stream);
-
             throw UnableToReadFile::fromLocation($path);
         }
 
@@ -210,10 +219,14 @@ class FtpAdapter implements FilesystemAdapter
     private function deleteFile(string $path, $connection): void
     {
         $location = $this->prefixer->prefixPath($path);
-        $success = @ftp_delete($connection, $location);
-
-        if ($success === false && ftp_size($connection, $location) !== -1) {
-            throw UnableToDeleteFile::atLocation($path, 'the file still exists');
+        try {
+            $this->client->delete($connection, $location);
+        } catch (RuntimeException $ex) {
+            if ($this->client->size($connection, $location) !== -1) {
+                throw UnableToDeleteFile::atLocation($path, 'the file still exists');
+            } else {
+                throw $ex;
+            }
         }
     }
 
@@ -239,7 +252,9 @@ class FtpAdapter implements FilesystemAdapter
         rsort($directories);
 
         foreach ($directories as $directory) {
-            if ( ! @ftp_rmdir($connection, $this->prefixer->prefixPath($directory))) {
+            try {
+                $this->client->rmdir($connection, $this->prefixer->prefixPath($directory));
+            } catch (RuntimeException $ex) {
                 throw UnableToDeleteDirectory::atLocation($path, "Could not delete directory $directory");
             }
         }
@@ -255,7 +270,9 @@ class FtpAdapter implements FilesystemAdapter
         $location = $this->prefixer->prefixPath($path);
         $mode = $this->visibilityConverter->forFile($visibility);
 
-        if ( ! @ftp_chmod($this->connection(), $mode, $location)) {
+        try {
+            $this->client->chmod($this->connection(), $mode, $location);
+        } catch (RuntimeException $ex) {
             throw UnableToSetVisibility::atLocation($path);
         }
     }
@@ -306,9 +323,9 @@ class FtpAdapter implements FilesystemAdapter
     {
         $location = $this->prefixer->prefixPath($path);
         $connection = $this->connection();
-        $lastModified = @ftp_mdtm($connection, $location);
-
-        if ($lastModified < 0) {
+        try {
+            $lastModified = $this->client->mdtm($connection, $location);
+        } catch (RuntimeException $ex) {
             throw UnableToRetrieveMetadata::lastModified($path);
         }
 
@@ -324,9 +341,9 @@ class FtpAdapter implements FilesystemAdapter
     {
         $location = $this->prefixer->prefixPath($path);
         $connection = $this->connection();
-        $fileSize = @ftp_size($connection, $location);
-
-        if ($fileSize < 0) {
+        try {
+            $fileSize = $this->client->size($connection, $location);
+        } catch (RuntimeException $ex) {
             throw UnableToRetrieveMetadata::fileSize($path);
         }
 
@@ -518,8 +535,12 @@ class FtpAdapter implements FilesystemAdapter
         if ($this->isPureFtpdServer()) {
             $path = str_replace(' ', '\ ', $path);
         }
-
-        return ftp_rawlist($connection, $options . ' ' . $path, stripos($options, 'R') !== false) ?: [];
+        try {
+            $ret = $this->client->rawlist($connection, $options . ' ' . $path, stripos($options, 'R'));
+        } catch (RuntimeException $ex) {
+            $ret = [];
+        }
+        return $ret;
     }
 
     public function move(string $source, string $destination, Config $config): void
@@ -534,7 +555,9 @@ class FtpAdapter implements FilesystemAdapter
         $destinationLocation = $this->prefixer->prefixPath($destination);
         $connection = $this->connection();
 
-        if ( ! @ftp_rename($connection, $sourceLocation, $destinationLocation)) {
+        try {
+            $this->client->rename($connection, $sourceLocation, $destinationLocation);
+        } catch (RuntimeException $ex) {
             throw UnableToMoveFile::fromLocationTo($source, $destination);
         }
     }
@@ -573,25 +596,32 @@ class FtpAdapter implements FilesystemAdapter
 
         $dirPath = '';
         $parts = explode('/', rtrim($dirname, '/'));
+
         $mode = $visibility ? $this->visibilityConverter->forDirectory($visibility) : false;
 
         foreach ($parts as $part) {
             $dirPath .= '/' . $part;
             $location = $this->prefixer->prefixPath($dirPath);
 
-            if (@ftp_chdir($connection, $location)) {
+            try {
+                $this->client->chdir($connection, $location);
                 continue;
+            } catch (RuntimeException $ex) {
+                // the location is not exists!
             }
 
             error_clear_last();
-            $result = @ftp_mkdir($connection, $location);
-
-            if ($result === false) {
+            try {
+                $this->client->mkdir($connection, $location);
+            } catch (RuntimeException $ex) {
                 $errorMessage = error_get_last()['message'] ?? 'unable to create the directory';
                 throw UnableToCreateDirectory::atLocation($dirPath, $errorMessage);
             }
-
-            if ($mode !== false && @ftp_chmod($connection, $mode, $location) === false) {
+            try {
+                if ($mode !== false) {
+                    $this->client->chmod($connection, (int)$mode, $location);
+                }
+            } catch (RuntimeException $ex) {
                 throw UnableToCreateDirectory::atLocation($dirPath, 'unable to chmod the directory');
             }
         }
